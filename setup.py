@@ -14,6 +14,10 @@
 #   See the License for the specific language governing permissions and       #
 #   limitations under the License.                                            #
 # --------------------------------------------------------------------------- #
+import sys, subprocess
+
+command = sys.executable + ' -m pip install redis>=4.2.0rc1<5 mmh3 typing_extensions'
+subprocess.run(command.split())
 
 
 import pathlib

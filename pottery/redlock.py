@@ -60,7 +60,7 @@ from redis import Redis
 from redis import RedisError
 from redis.commands.core import Script
 # TODO: When we drop support for Python 3.7, change the following import to:
-#   from typing import Final
+#   from typing import Literal
 from typing_extensions import Literal
 
 from .annotations import F
@@ -74,8 +74,8 @@ from .executor import BailOutExecutor
 from .timer import ContextTimer
 
 
-class _Scripts(Primitive):
-    '''Parent class to define/register Lua scripts for Redis.
+class Scripts:
+    '''Mixin class to define/register Lua scripts for Redis.
 
     Note that we only have to register these Lua scripts once -- so we do it on
     the first instantiation of Redlock.
@@ -93,7 +93,7 @@ class _Scripts(Primitive):
                  masters: Iterable[Redis] = frozenset(),
                  raise_on_redis_errors: bool = False,
                  ) -> None:
-        super().__init__(
+        super().__init__(  # type: ignore
             key=key,
             masters=masters,
             raise_on_redis_errors=raise_on_redis_errors,
@@ -109,7 +109,7 @@ class _Scripts(Primitive):
         if self._acquired_script is None:
             class_name = self.__class__.__qualname__
             logger.info('Registering %s._acquired_script', class_name)
-            master = next(iter(self.masters))
+            master = next(iter(self.masters))  # type: ignore
             # Available since Redis 2.6.0:
             self.__class__._acquired_script = master.register_script('''
                 if redis.call('get', KEYS[1]) then
@@ -124,10 +124,10 @@ class _Scripts(Primitive):
         if self._extend_script is None:
             class_name = self.__class__.__qualname__
             logger.info('Registering %s._extend_script', class_name)
-            master = next(iter(self.masters))
+            master = next(iter(self.masters))  # type: ignore
             # Available since Redis 2.6.0:
             self.__class__._extend_script = master.register_script('''
-                if redis.call('get', KEYS[1]) == ARGV[1] then
+                if redis.call('get', KEYS[1]) then
                     return redis.call('pexpire', KEYS[1], ARGV[2])
                 else
                     return 0
@@ -138,7 +138,7 @@ class _Scripts(Primitive):
         if self._release_script is None:
             class_name = self.__class__.__qualname__
             logger.info('Registering %s._release_script', class_name)
-            master = next(iter(self.masters))
+            master = next(iter(self.masters))  # type: ignore
             # Available since Redis 2.6.0:
             self.__class__._release_script = master.register_script('''
                 if redis.call('get', KEYS[1]) then
@@ -149,7 +149,7 @@ class _Scripts(Primitive):
             ''')
 
 
-class Redlock(_Scripts):
+class Redlock(Scripts, Primitive):
     '''Distributed Redis-powered lock.
 
     This algorithm safely and reliably provides a mutually-exclusive locking
@@ -162,13 +162,13 @@ class Redlock(_Scripts):
     Usage:
 
         >>> from redis import Redis
-        >>> redis = Redis(socket_timeout=1)
-        >>> printer_lock = Redlock(key='printer', masters={redis})
+        >>> redis = Redis()
+        >>> printer_lock = Redlock(key='printer', masters={redis}, auto_release_time=.2)
         >>> bool(printer_lock.locked())
         False
         >>> if printer_lock.acquire():
-        ...     print('printer_lock is locked')
         ...     # Critical section - print stuff here.
+        ...     print('printer_lock is locked')
         printer_lock is locked
         >>> printer_lock.release()
         >>> bool(printer_lock.locked())
@@ -183,36 +183,35 @@ class Redlock(_Scripts):
 
         >>> if printer_lock.acquire():
         ...     # Critical section - print stuff here.
-        ...     time.sleep(10)
-        >>> time.sleep(10)
+        ...     time.sleep(printer_lock.auto_release_time)
         >>> bool(printer_lock.locked())
         False
 
     If 10 seconds isn't enough to complete executing your critical section,
     then you can specify your own timeout:
 
-        >>> printer_lock = Redlock(key='printer', masters={redis}, auto_release_time=15)
+        >>> printer_lock = Redlock(key='printer', masters={redis}, auto_release_time=.2)
         >>> if printer_lock.acquire():
         ...     # Critical section - print stuff here.
-        ...     time.sleep(10)
+        ...     time.sleep(printer_lock.auto_release_time / 2)
         >>> bool(printer_lock.locked())
         True
-        >>> time.sleep(5)
+        >>> time.sleep(printer_lock.auto_release_time / 2)
         >>> bool(printer_lock.locked())
         False
 
     You can use a Redlock as a context manager:
 
         >>> with Redlock(key='printer', masters={redis}) as printer_lock:
-        ...     print('printer_lock is locked')
         ...     # Critical section - print stuff here.
+        ...     print('printer_lock is locked')
         printer_lock is locked
         >>> bool(printer_lock.locked())
         False
 
         >>> with printer_lock:
-        ...     print('printer_lock is locked')
         ...     # Critical section - print stuff here.
+        ...     print('printer_lock is locked')
         printer_lock is locked
         >>> bool(printer_lock.locked())
         False
@@ -338,8 +337,8 @@ class Redlock(_Scripts):
                     redis_errors.append(error)
                     logger.exception(
                         '%s.__acquire_masters() caught %s',
-                        self.__class__.__name__,
-                        error.__class__.__name__,
+                        self.__class__.__qualname__,
+                        error.__class__.__qualname__,
                     )
                 else:
                     if num_masters_acquired > len(self.masters) // 2:
@@ -368,8 +367,8 @@ class Redlock(_Scripts):
         necessary to acquire the lock.  Return True.
 
             >>> from redis import Redis
-            >>> redis = Redis(socket_timeout=1)
-            >>> printer_lock_1 = Redlock(key='printer', masters={redis})
+            >>> redis = Redis()
+            >>> printer_lock_1 = Redlock(key='printer', masters={redis}, auto_release_time=.2)
             >>> printer_lock_1.acquire()
             True
             >>> timer = ContextTimer()
@@ -377,7 +376,7 @@ class Redlock(_Scripts):
             >>> printer_lock_2 = Redlock(key='printer', masters={redis})
             >>> printer_lock_2.acquire()
             True
-            >>> 10 * 1000 < timer.elapsed() < 11 * 1000
+            >>> timer.elapsed() > printer_lock_1.auto_release_time * 1000
             True
             >>> printer_lock_2.release()
 
@@ -387,15 +386,16 @@ class Redlock(_Scripts):
 
             >>> printer_lock_1.acquire()
             True
-            >>> printer_lock_2.acquire(timeout=15)
+            >>> printer_lock_2.acquire(timeout=.5)
             True
             >>> printer_lock_2.release()
 
             >>> printer_lock_1.acquire()
             True
-            >>> printer_lock_2.acquire(timeout=1)
+            >>> printer_lock_2.acquire(timeout=.1)
             False
-            >>> printer_lock_1.release()
+            >>> with contextlib.suppress(ReleaseUnlockedLock):
+            ...     printer_lock_1.release()
 
         If blocking is False and timeout is -1, then try just once right now to
         acquire the lock.  Return True if the lock was acquired; False if it
@@ -416,17 +416,16 @@ class Redlock(_Scripts):
             enqueued = False
             with ContextTimer() as timer:
                 while timeout == -1 or timer.elapsed() / 1000 < timeout:
-                    acquired = acquire_masters()
-                    if acquired:
+                    if acquire_masters():
                         if enqueued:
                             self.__log_time_enqueued(timer, True)
                         return True
                     enqueued = True
                     delay = random.uniform(0, self._RETRY_DELAY)  # nosec
                     time.sleep(delay)
-            if enqueued:
+            if enqueued:  # pragma: no cover
                 self.__log_time_enqueued(timer, False)
-            return False
+            return False  # pragma: no cover
 
         if timeout == -1:
             return acquire_masters()
@@ -452,7 +451,7 @@ class Redlock(_Scripts):
         If we don't currently hold the lock, then this method returns 0.
 
             >>> from redis import Redis
-            >>> redis = Redis(socket_timeout=1)
+            >>> redis = Redis()
             >>> printer_lock_1 = Redlock(key='printer', masters={redis})
             >>> printer_lock_1.locked()
             0
@@ -472,7 +471,6 @@ class Redlock(_Scripts):
             >>> 9 < printer_lock_1.locked() < 10
             True
             >>> printer_lock_1.release()
-
         '''
         with ContextTimer() as timer, BailOutExecutor() as executor:
             futures = set()
@@ -488,8 +486,8 @@ class Redlock(_Scripts):
                     redis_errors.append(error)
                     logger.exception(
                         '%s.locked() caught %s',
-                        self.__class__.__name__,
-                        error.__class__.__name__,
+                        self.__class__.__qualname__,
+                        error.__class__.__qualname__,
                     )
                 else:
                     if ttl:
@@ -509,7 +507,7 @@ class Redlock(_Scripts):
         Usage:
 
             >>> from redis import Redis
-            >>> redis = Redis(socket_timeout=1)
+            >>> redis = Redis()
             >>> printer_lock = Redlock(key='printer', masters={redis})
             >>> printer_lock.acquire()
             True
@@ -540,8 +538,8 @@ class Redlock(_Scripts):
                     redis_errors.append(error)
                     logger.exception(
                         '%s.extend() caught %s',
-                        self.__class__.__name__,
-                        error.__class__.__name__,
+                        self.__class__.__qualname__,
+                        error.__class__.__qualname__,
                     )
                 else:
                     if num_masters_extended > len(self.masters) // 2:
@@ -561,7 +559,7 @@ class Redlock(_Scripts):
         Usage:
 
             >>> from redis import Redis
-            >>> redis = Redis(socket_timeout=1)
+            >>> redis = Redis()
             >>> printer_lock = Redlock(key='printer', masters={redis})
             >>> bool(printer_lock.locked())
             False
@@ -587,8 +585,8 @@ class Redlock(_Scripts):
                     redis_errors.append(error)
                     logger.exception(
                         '%s.release() caught %s',
-                        self.__class__.__name__,
-                        error.__class__.__name__,
+                        self.__class__.__qualname__,
+                        error.__class__.__qualname__,
                     )
                 else:
                     if num_masters_released > len(self.masters) // 2:
@@ -609,17 +607,17 @@ class Redlock(_Scripts):
         Usage:
 
             >>> from redis import Redis
-            >>> redis = Redis(socket_timeout=1)
+            >>> redis = Redis()
             >>> with Redlock(key='printer', masters={redis}) as printer_lock:
-            ...     print('printer_lock is locked')
             ...     # Critical section - print stuff here.
+            ...     print('printer_lock is locked')
             printer_lock is locked
             >>> bool(printer_lock.locked())
             False
 
             >>> with printer_lock:
-            ...     print('printer_lock is locked')
             ...     # Critical section - print stuff here.
+            ...     print('printer_lock is locked')
             printer_lock is locked
             >>> bool(printer_lock.locked())
             False
@@ -658,17 +656,17 @@ class Redlock(_Scripts):
         Usage:
 
             >>> from redis import Redis
-            >>> redis = Redis(socket_timeout=1)
+            >>> redis = Redis()
             >>> with Redlock(key='printer', masters={redis}) as printer_lock:
-            ...     print('printer_lock is locked')
             ...     # Critical section - print stuff here.
+            ...     print('printer_lock is locked')
             printer_lock is locked
             >>> bool(printer_lock.locked())
             False
 
             >>> with printer_lock:
-            ...     print('printer_lock is locked')
             ...     # Critical section - print stuff here.
+            ...     print('printer_lock is locked')
             printer_lock is locked
             >>> bool(printer_lock.locked())
             False
@@ -677,7 +675,7 @@ class Redlock(_Scripts):
         return False
 
     def __repr__(self) -> str:
-        return f'<{self.__class__.__name__} key={self.key}>'
+        return f'<{self.__class__.__qualname__} key={self.key}>'
 
 
 def synchronize(*,
@@ -774,13 +772,3 @@ def _log_synchronize(func: F,
             redlock.key,
             waiting_timer.elapsed(),
         )
-
-
-if __name__ == '__main__':
-    # Run the doctests in this module with:
-    #   $ source venv/bin/activate
-    #   $ python3 -m pottery.redlock
-    #   $ deactivate
-    with contextlib.suppress(ImportError):
-        from tests.base import run_doctests
-        run_doctests()
